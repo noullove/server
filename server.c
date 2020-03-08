@@ -94,11 +94,7 @@ static void signal_handler(int signo, siginfo_t* info, void* arg)
 	switch (signo)
 	{
 	case SIGTERM:
-		// TODO: what to do at the end of the process
-
-		ZF_LOGD("server shutdown");
 		exit(0);
-		break;
 	case SIGCHLD:
 		spid = wait(&status);
 		ZF_LOGD("child process exit (%d)", spid);
@@ -109,12 +105,10 @@ static void signal_handler(int signo, siginfo_t* info, void* arg)
 	default:
 		break;
 	}
-
-	return;
 }
 
 // create transaction ID (for log search)
-static void get_transaction_id(char* transaction_id)
+static void get_tran_id(char* transaction_id)
 {
 	uint32_t time_low;
 	uint16_t time_mid;
@@ -146,7 +140,9 @@ static void* net_thread_callback(void* arg)
 
 	ZF_LOGD("disconnected");
 
-	evutil_closesocket(client->fd);
+	evutil_closesocket(bufferevent_getfd(client->bev));
+	bufferevent_free(client->bev);
+	event_base_free(client->base);
 	free(client);
 
 	return NULL;
@@ -217,76 +213,20 @@ static void net_server_error_callback(struct evconnlistener* listener, void* arg
 	event_base_loopexit(base, NULL);
 }
 
-// fork network server
-static void net_server_fork(server_info_t* server)
+// socket accept event callback
+static void
+net_server_callback(struct evconnlistener* lev, evutil_socket_t fd, struct sockaddr* sa, int socklen, void* arg)
 {
-	client_info_t* client;
-
-	struct sockaddr_in* client_addr = (struct sockaddr_in*)server->sa;
-	struct bufferevent* bev;
-	struct timeval tv = { 2, 0 };
-
-	int pid;
-
-	// prevent child processes from listening after fork()
-	evconnlistener_disable(server->listener);
-
-	pid = fork();
-
-	switch (pid)
-	{
-	case 0: // child process
-		event_reinit(server->base);
-
-		client = calloc(1, sizeof(*client));
-		if (client == NULL)
-		{
-			ZF_LOGW("calloc() failed");
-			return;
-		}
-
-		client->fd = server->fd;
-
-		bev = bufferevent_socket_new(server->base, server->fd, BEV_OPT_CLOSE_ON_FREE);
-		if (!bev)
-		{
-			ZF_LOGW("bufferevent_socket_new() failed");
-			return;
-		}
-
-		// timeout setting (2 secs)
-		bufferevent_set_timeouts(bev, &tv, &tv);
-
-		evutil_inet_ntop(AF_INET, &client_addr->sin_addr, client->ip, sizeof(client->ip));
-		get_transaction_id(client->transaction_id);
-		zf_log_set_tag_prefix(client->transaction_id);
-
-		ZF_LOGD("client ip : %s", client->ip);
-
-		bufferevent_setcb(bev, net_read_callback, NULL, net_event_callback, client);
-		bufferevent_enable(bev, EV_READ | EV_WRITE);
-		break;
-	case -1: // fork fail
-		ZF_LOGW("fork() failed");
-		evconnlistener_enable(server->listener);
-		break;
-	default: // parent process
-		ZF_LOGD("child process fork (%d)", pid);
-		evutil_closesocket(server->fd);
-		evconnlistener_enable(server->listener);
-	}
-}
-
-#ifdef _THREAD
-// thread network server
-static void net_server_thread(server_info_t *server)
-{
+	server_info_t* server = (server_info_t*)arg;
 	client_info_t *client;
 
-	struct event_config *cfg;
-	struct sockaddr_in *client_addr = (struct sockaddr_in *)server->sa;
-	struct bufferevent *bev;
+	struct sockaddr_in *client_addr = (struct sockaddr_in *)sa;
 	struct timeval tv = {2, 0};
+
+	ZF_LOGD("connected");
+
+#ifdef _THREAD
+	struct event_config *cfg;
 
 	client = calloc(1, sizeof(*client));
 	if (client == NULL)
@@ -294,8 +234,6 @@ static void net_server_thread(server_info_t *server)
 		ZF_LOGW("calloc() failed");
 		return;
 	}
-
-	client->fd = server->fd;
 
 	// libevent setting
 	cfg = event_config_new();
@@ -312,45 +250,75 @@ static void net_server_thread(server_info_t *server)
 		return;
 	}
 
-	bev = bufferevent_socket_new(client->base, server->fd, BEV_OPT_CLOSE_ON_FREE);
-	if (!bev)
+	client->bev = bufferevent_socket_new(client->base, fd, BEV_OPT_CLOSE_ON_FREE);
+	if (!client->bev)
 	{
 		ZF_LOGW("bufferevent_socket_new() failed");
 		return;
 	}
 
 	// timeout setting (2 secs)
-	bufferevent_set_timeouts(bev, &tv, &tv);
+	bufferevent_set_timeouts(client->bev, &tv, &tv);
 
 	evutil_inet_ntop(AF_INET, &client_addr->sin_addr, client->ip, sizeof(client->ip));
-	get_transaction_id(client->transaction_id);
-	zf_log_set_tag_prefix(client->transaction_id);
+	get_tran_id(client->tran_id);
+	zf_log_set_tag_prefix(client->tran_id);
 
 	ZF_LOGD("client ip : %s", client->ip);
 
-	bufferevent_setcb(bev, net_read_callback, NULL, net_event_callback, client);
-	bufferevent_enable(bev, EV_READ | EV_WRITE);
+	bufferevent_setcb(client->bev, net_read_callback, NULL, net_event_callback, client);
+	bufferevent_enable(client->bev, EV_READ | EV_WRITE);
 
 	// add job to thread pool queue
 	thr_pool_queue(server->thread, net_thread_callback, client);
-}
-#endif
-
-// socket accept event callback
-static void
-net_server_callback(struct evconnlistener* listener, evutil_socket_t fd, struct sockaddr* sa, int socklen, void* arg)
-{
-	server_info_t* server = (server_info_t*)arg;
-
-	server->fd = fd;
-	server->sa = sa;
-
-	ZF_LOGD("connected");
-
-#ifdef _THREAD
-	net_server_thread(server);
 #else
-	net_server_fork(server);
+	pid_t pid;
+
+	// prevent child processes from listening after fork()
+	evconnlistener_disable(server->lev);
+
+	pid = fork();
+
+	switch (pid)
+	{
+	case 0: // child process
+		event_reinit(server->base);
+
+		client = calloc(1, sizeof(*client));
+		if (client == NULL)
+		{
+			ZF_LOGW("calloc() failed");
+			return;
+		}
+
+		client->bev = bufferevent_socket_new(server->base, fd, BEV_OPT_CLOSE_ON_FREE);
+		if (!client->bev)
+		{
+			ZF_LOGW("bufferevent_socket_new() failed");
+			return;
+		}
+
+		// timeout setting (2 secs)
+		bufferevent_set_timeouts(client->bev, &tv, &tv);
+
+		evutil_inet_ntop(AF_INET, &client_addr->sin_addr, client->ip, sizeof(client->ip));
+		get_tran_id(client->tran_id);
+		zf_log_set_tag_prefix(client->tran_id);
+
+		ZF_LOGD("client ip : %s", client->ip);
+
+		bufferevent_setcb(client->bev, net_read_callback, NULL, net_event_callback, client);
+		bufferevent_enable(client->bev, EV_READ | EV_WRITE);
+		break;
+	case -1: // fork fail
+		ZF_LOGW("fork() failed");
+		evconnlistener_enable(server->lev);
+		break;
+	default: // parent process
+		ZF_LOGD("child process fork (%d)", pid);
+		evutil_closesocket(fd);
+		evconnlistener_enable(server->lev);
+	}
 #endif
 }
 
@@ -359,15 +327,20 @@ static void net_server_exit(int status, void* arg)
 {
 	server_info_t* server = (server_info_t*)arg;
 
-	evconnlistener_free(server->listener);
-	event_base_free(server->base);
-
+	if (server->pid == getpid())
+	{
+		evconnlistener_free(server->lev);
+		event_base_free(server->base);
 #ifdef _THREAD
-	thr_pool_wait(server->thread);
-	thr_pool_destroy(server->thread);
+		thr_pool_wait(server->thread);
+		thr_pool_destroy(server->thread);
 #endif
-
-	ZF_LOGI("server shutdown");
+		ZF_LOGD("server shutdown");
+	}
+	else
+	{
+		ZF_LOGD("disconnected");
+	}
 }
 
 // network server setting
@@ -379,6 +352,8 @@ int net_server()
 	unsigned int flags = 0;
 
 	// daemonlize();
+
+	server.pid = getpid();
 
 	// libevent initialize
 	event_init();
@@ -417,16 +392,16 @@ int net_server()
 	flags = LEV_OPT_REUSEABLE | LEV_OPT_CLOSE_ON_FREE;
 #endif
 
-	server.listener = evconnlistener_new_bind(server.base, net_server_callback, &server, flags, -1,
+	server.lev = evconnlistener_new_bind(server.base, net_server_callback, &server, flags, -1,
 		(struct sockaddr*)&server_addr, sizeof(server_addr));
 
-	if (!server.listener)
+	if (!server.lev)
 	{
 		ZF_LOGW("evconnlistener_new_bind() failed");
 		return -1;
 	}
 
-	evconnlistener_set_error_cb(server.listener, net_server_error_callback);
+	evconnlistener_set_error_cb(server.lev, net_server_error_callback);
 	on_exit(net_server_exit, &server);
 
 	ZF_LOGI("server start");
@@ -437,9 +412,6 @@ int net_server()
 	signal_register(SIGALRM, signal_handler);
 
 	event_base_dispatch(server.base);
-
-	evconnlistener_free(server.listener);
-	event_base_free(server.base);
 	return 0;
 }
 

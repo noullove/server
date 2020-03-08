@@ -37,28 +37,26 @@ typedef struct
 {
     char path[1024];
     FILE* fp;
-    struct tm ctime;
 } log_info_t;
 
 // server info
 typedef struct
 {
+	pid_t pid;
     struct event_base* base;
-    struct evconnlistener* listener;
+    struct evconnlistener* lev;
 #ifdef _THREAD
     thr_pool_t *thread;
 #endif
-    evutil_socket_t fd;
-    struct sockaddr* sa;
 } server_info_t;
 
 // client connection info
 typedef struct
 {
     char ip[20];
-    char transaction_id[24];
+    char tran_id[24];
     struct event_base* base;
-    evutil_socket_t fd;
+    struct bufferevent* bev;
 } client_info_t;
 
 #ifdef __cplusplus
