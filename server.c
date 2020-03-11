@@ -79,7 +79,7 @@ static void signal_register(int signum, void* handler)
 }
 
 // signal handler
-static void signal_handler(int signo, siginfo_t* info, void* arg)
+static void signal_handler(int signo)
 {
 	int status;
 	int spid;
@@ -138,12 +138,7 @@ static void* net_thread_callback(void* arg)
 
 	event_base_dispatch(client->base);
 
-	ZF_LOGD("disconnected");
-
-	evutil_closesocket(bufferevent_getfd(client->bev));
-	bufferevent_free(client->bev);
-	event_base_free(client->base);
-	free(client);
+    ZF_LOGD("disconnected");
 
 	return NULL;
 }
@@ -152,13 +147,17 @@ static void* net_thread_callback(void* arg)
 static void net_read_callback(struct bufferevent* bev, void* arg)
 {
 	client_info_t* client = (client_info_t*)arg;
-	struct evbuffer* input = bufferevent_get_input(bev);
 	struct timeval tv = { 5, 0 };
+
+    struct evbuffer_iovec v;
 
 	// reset timeout
 	bufferevent_set_timeouts(bev, NULL, NULL);
 
 	// TODO: data receive processing
+	// view data in read buffer
+    evbuffer_peek(bev->input, -1, NULL, &v, 1);
+    ZF_LOGD("[%d][%s]", v.iov_len, (char *)v.iov_base);
 	// TODO: message processing
 
 	// timeout setting
@@ -186,27 +185,30 @@ static void net_event_callback(struct bufferevent* bev, short events, void* arg)
 		ZF_LOGD("timeout");
 		if (events & BEV_EVENT_READING)
 		{
-			// TODO: when data is read to read buffer
+			// TODO: if there is data in the read buffer
 		}
 	}
 
 	// connection termination event processing
 	if (events & BEV_EVENT_EOF)
-	{
-		ZF_LOGD("disconnected");
-	}
+		ZF_LOGD("client disconnected");
 
 	// error event handling
 	if (events & BEV_EVENT_ERROR)
 	{
 		ZF_LOGD("%s", evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
 	}
+
+	evutil_closesocket(bufferevent_getfd(client->bev));
+	bufferevent_free(client->bev);
+	event_base_free(client->base);
+	free(client);
 }
 
 // set an error callback on a listener
-static void net_server_error_callback(struct evconnlistener* listener, void* arg)
+static void net_server_error_callback(struct evconnlistener* lev, void* arg)
 {
-	struct event_base* base = evconnlistener_get_base(listener);
+	struct event_base* base = evconnlistener_get_base(lev);
 	int err = EVUTIL_SOCKET_ERROR();
 
 	ZF_LOGW("got an error %d (%s) on the listener. shutting down.", err, evutil_socket_error_to_string(err));
@@ -222,8 +224,6 @@ net_server_callback(struct evconnlistener* lev, evutil_socket_t fd, struct socka
 
 	struct sockaddr_in *client_addr = (struct sockaddr_in *)sa;
 	struct timeval tv = {2, 0};
-
-	ZF_LOGD("connected");
 
 #ifdef _THREAD
 	struct event_config *cfg;
@@ -257,13 +257,14 @@ net_server_callback(struct evconnlistener* lev, evutil_socket_t fd, struct socka
 		return;
 	}
 
-	// timeout setting (2 secs)
+	// timeout setting
 	bufferevent_set_timeouts(client->bev, &tv, &tv);
 
 	evutil_inet_ntop(AF_INET, &client_addr->sin_addr, client->ip, sizeof(client->ip));
 	get_tran_id(client->tran_id);
 	zf_log_set_tag_prefix(client->tran_id);
 
+    ZF_LOGD("connected");
 	ZF_LOGD("client ip : %s", client->ip);
 
 	bufferevent_setcb(client->bev, net_read_callback, NULL, net_event_callback, client);
@@ -275,13 +276,15 @@ net_server_callback(struct evconnlistener* lev, evutil_socket_t fd, struct socka
 	pid_t pid;
 
 	// prevent child processes from listening after fork()
-	evconnlistener_disable(server->lev);
+	evconnlistener_disable(lev);
 
 	pid = fork();
 
 	switch (pid)
 	{
 	case 0: // child process
+		evutil_closesocket(evconnlistener_get_fd(lev));
+		evconnlistener_free(lev);
 		event_reinit(server->base);
 
 		client = calloc(1, sizeof(*client));
@@ -298,13 +301,14 @@ net_server_callback(struct evconnlistener* lev, evutil_socket_t fd, struct socka
 			return;
 		}
 
-		// timeout setting (2 secs)
+		// timeout setting
 		bufferevent_set_timeouts(client->bev, &tv, &tv);
 
 		evutil_inet_ntop(AF_INET, &client_addr->sin_addr, client->ip, sizeof(client->ip));
 		get_tran_id(client->tran_id);
 		zf_log_set_tag_prefix(client->tran_id);
 
+		ZF_LOGD("connected");
 		ZF_LOGD("client ip : %s", client->ip);
 
 		bufferevent_setcb(client->bev, net_read_callback, NULL, net_event_callback, client);
@@ -312,12 +316,12 @@ net_server_callback(struct evconnlistener* lev, evutil_socket_t fd, struct socka
 		break;
 	case -1: // fork fail
 		ZF_LOGW("fork() failed");
-		evconnlistener_enable(server->lev);
+		evconnlistener_enable(lev);
 		break;
 	default: // parent process
 		ZF_LOGD("child process fork (%d)", pid);
 		evutil_closesocket(fd);
-		evconnlistener_enable(server->lev);
+		evconnlistener_enable(lev);
 	}
 #endif
 }
@@ -338,8 +342,8 @@ static void net_server_exit(int status, void* arg)
 		ZF_LOGD("server shutdown");
 	}
 	else
-	{
-		ZF_LOGD("disconnected");
+    {
+        ZF_LOGD("disconnected");
 	}
 }
 
@@ -356,6 +360,7 @@ int net_server()
 	server.pid = getpid();
 
 	// libevent initialize
+	ZF_LOGD("%s", event_get_version());
 	event_init();
 
 #ifdef _THREAD
@@ -375,6 +380,8 @@ int net_server()
 	}
 
 	event_config_free(cfg);
+
+	ZF_LOGD("%s", event_base_get_method(server.base));
 
 #ifdef _THREAD
 	server.thread = thr_pool_create(5, 5, 0, NULL);
