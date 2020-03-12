@@ -284,7 +284,6 @@ net_server_callback(struct evconnlistener* lev, evutil_socket_t fd, struct socka
 	{
 	case 0: // child process
 		evutil_closesocket(evconnlistener_get_fd(lev));
-		evconnlistener_free(lev);
 		event_reinit(server->base);
 
 		client = calloc(1, sizeof(*client));
@@ -324,27 +323,6 @@ net_server_callback(struct evconnlistener* lev, evutil_socket_t fd, struct socka
 		evconnlistener_enable(lev);
 	}
 #endif
-}
-
-// network server shutdown processing
-static void net_server_exit(int status, void* arg)
-{
-	server_info_t* server = (server_info_t*)arg;
-
-	if (server->pid == getpid())
-	{
-		evconnlistener_free(server->lev);
-		event_base_free(server->base);
-#ifdef _THREAD
-		thr_pool_wait(server->thread);
-		thr_pool_destroy(server->thread);
-#endif
-		ZF_LOGD("server shutdown");
-	}
-	else
-    {
-        ZF_LOGD("disconnected");
-	}
 }
 
 // network server setting
@@ -409,7 +387,6 @@ int net_server()
 	}
 
 	evconnlistener_set_error_cb(server.lev, net_server_error_callback);
-	on_exit(net_server_exit, &server);
 
 	ZF_LOGI("server start");
 
@@ -419,6 +396,20 @@ int net_server()
 	signal_register(SIGALRM, signal_handler);
 
 	event_base_dispatch(server.base);
+
+	// network server shutdown processing
+	evconnlistener_free(server.lev);
+	event_base_free(server.base);
+#ifdef _THREAD
+	thr_pool_wait(server.thread);
+	thr_pool_destroy(server.thread);
+#endif
+
+	if (server.pid == getpid())
+		ZF_LOGD("server shutdown");
+	else
+		ZF_LOGD("disconnected");
+
 	return 0;
 }
 
